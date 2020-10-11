@@ -1,4 +1,4 @@
-# Learning to Expire - Pytorch
+## Learning to Expire - Pytorch (wip)
 
 An implementation of Transformer with Expire-Span, a circuit for learning which memories to retain for long-range learning in attention-based networks.
 
