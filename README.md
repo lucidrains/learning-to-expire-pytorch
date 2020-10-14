@@ -2,7 +2,7 @@
 
 ## Learning to Expire - Pytorch (wip)
 
-An implementation of Transformer with Expire-Span, a proposed technique for learning which memories to retain for long-range learning in attention-based networks.
+An implementation of Transformer with <a href="https://openreview.net/forum?id=ZVBtN6B_6i7">Expire-Span</a>, a proposed technique for learning which memories to retain for long-range learning in attention-based networks.
 
 ## Citations
 
@@ -13,7 +13,7 @@ An implementation of Transformer with Expire-Span, a proposed technique for lear
     author={Anonymous},
     booktitle={Submitted to International Conference on Learning Representations},
     year={2021},
-    url={<a href="https://openreview.net/forum?id=ZVBtN6B_6i7">https://openreview.net/forum?id=ZVBtN6B_6i7</a>},
+    url={https://openreview.net/forum?id=ZVBtN6B_6i7},
     note={under review}
 }
 ```
