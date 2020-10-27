@@ -12,6 +12,12 @@ def exists(val):
 def default(val, d):
     return val if exists(val) else d
 
+def safe_cat(tensors, dim = -1):
+    tensors = list(filter(exists, tensors))
+    if len(tensors) == 1:
+        return tensors[0]
+    return torch.cat(tensors, dim = dim)
+
 # classes
 
 class PreNorm(nn.Module):
@@ -51,12 +57,10 @@ class CausalAttention(nn.Module):
 
         q = self.to_q(x)
 
-        mem_len = 0
-        if exists(mem):
-            mem_len = mem.shape[1]
-            x = torch.cat((mem, x), dim = 1)
+        mem_len = mem.shape[1] if exists(mem) else 0
+        context = safe_cat((mem, x), dim = 1)
 
-        kv = self.to_kv(x).chunk(2, dim = -1)
+        kv = self.to_kv(context).chunk(2, dim = -1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, *kv))
 
         dots = einsum('b h i d, b h j d -> b h i j', q, k) * scale
@@ -86,6 +90,8 @@ class ExpireSpanTransformerXL(nn.Module):
         self.token_emb = nn.Embedding(num_tokens, dim)
 
         self.depth = depth
+        self.max_mem_len = num_memory_blocks * seq_len
+
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
@@ -106,4 +112,8 @@ class ExpireSpanTransformerXL(nn.Module):
             x = attn(x, mem = mem) + x
             x = ff(x) + x
 
-        return self.to_logits(x), hidden_states
+        logits = self.to_logits(x)
+
+        new_memories = map(lambda t: safe_cat(t, dim = 1), list(zip(mems, hidden_states)))
+        new_memories = map(lambda t: t[:, -self.max_mem_len:].detach(), new_memories)
+        return logits, list(new_memories)
