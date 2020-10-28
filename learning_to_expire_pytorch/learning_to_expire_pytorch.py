@@ -32,9 +32,14 @@ class ExpireSpan(nn.Module):
         self.ramp_length = ramp_length
         self.to_expiration = nn.Linear(dim, 1)
 
-    def forward(self, x):
-        expirations = self.to_expiration(x).squeeze(-1).sigmoid() * self.max_mem_len
-        return expirations
+    def forward(self, mem, time, seq_len):
+        exps = self.to_expiration(mem).squeeze(-1).sigmoid() * self.max_mem_len
+        exps = rearrange(exps, 'b j -> b () () j')
+        t = rearrange(time, 'j -> () j')
+        r = F.pad(exps - t, (0, seq_len), value = 1.)
+        R = (r / self.ramp_length) + 1
+        mask = R.clamp(min = 0., max = 1.)
+        return exps, mask
 
 # classes
 
@@ -61,17 +66,16 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class CausalAttention(nn.Module):
-    def __init__(self, dim, expire_span, heads = 8):
+    def __init__(self, dim, heads = 8):
         super().__init__()
         self.heads = heads
         self.scale = (dim // heads) ** -0.5
-        self.expire_span = expire_span
 
         self.to_q = nn.Linear(dim, dim, bias = False)
         self.to_kv = nn.Linear(dim, dim * 2, bias = False)
         self.to_out = nn.Linear(dim, dim)
 
-    def forward(self, x, mem = None, time = None):
+    def forward(self, x, mem = None, expire_mask = None):
         n, h, scale, device = x.shape[1], self.heads, self.scale, x.device
 
         q = self.to_q(x)
@@ -91,18 +95,12 @@ class CausalAttention(nn.Module):
 
         attn = dots.softmax(dim = -1)
 
-        exps = None
-        if exists(mem):
-            exps = self.expire_span(mem)
-            exps = rearrange(exps, 'b j -> b () () j')
-            t = rearrange(time, 'j -> () j')
-            r = F.pad(exps - t, (0, n), value = 1.)
-            m = r.clamp(min = 0., max = 1.)
-            attn  = attn * m
+        if exists(expire_mask):
+            attn  = attn * expire_mask
 
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out), exps
+        return self.to_out(out)
 
 class ExpireSpanTransformerXL(nn.Module):
     def __init__(
@@ -123,13 +121,13 @@ class ExpireSpanTransformerXL(nn.Module):
         self.seq_len = seq_len
         self.max_mem_len = num_memory_blocks * seq_len
 
-        self.expire_span = ExpireSpan(dim, self.max_mem_len, ramp_length)
         self.expire_loss_coef = expire_loss_coef
 
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                PreNorm(dim, CausalAttention(dim, self.expire_span, heads = heads)),
+                ExpireSpan(dim, self.max_mem_len, ramp_length),
+                PreNorm(dim, CausalAttention(dim, heads = heads)),
                 PreNorm(dim, FeedForward(dim)),
             ]))
 
@@ -145,12 +143,12 @@ class ExpireSpanTransformerXL(nn.Module):
         times_layers = default(elapsed_times, (None,) * self.depth)
         aux_loss = torch.tensor(0., requires_grad = True)
 
-        for (mem, time, (attn, ff)) in zip(mems_layers, times_layers, self.layers):
+        for (mem, time, (expire_span, attn, ff)) in zip(mems_layers, times_layers, self.layers):
             hidden_states.append(x)
 
-            attn_out, exps = attn(x, mem = mem, time = time)
+            exps, expire_mask = expire_span(mem, time, seq_len = n) if exists(mem) else (None, None)
 
-            x = x + attn_out
+            x = attn(x, mem = mem, expire_mask = expire_mask) + x
             x = ff(x) + x
 
             if exists(exps):
