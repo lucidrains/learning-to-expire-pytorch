@@ -4,6 +4,10 @@ import torch.nn.functional as F
 from einops import rearrange
 from collections import namedtuple
 
+# constants
+
+Memory = namedtuple('Memory', ['mems', 'elapsed_times'])
+
 # helpers
 
 def exists(val):
@@ -133,14 +137,13 @@ class ExpireSpanTransformerXL(nn.Module):
 
         self.to_logits = nn.Linear(dim, num_tokens)
 
-    def forward(self, x, mems = None, elapsed_times = None):
+    def forward(self, x, memory = None):
         n, device = x.shape[1], x.device
         x = self.token_emb(x)
 
-
         hidden_states = []
-        mems_layers = default(mems, (None,) * self.depth)
-        times_layers = default(elapsed_times, (None,) * self.depth)
+        mems_layers = memory.mems if exists(memory) else ((None,) * self.depth)
+        times_layers = memory.elapsed_times if exists(memory) else ((None,) * self.depth)
         aux_loss = torch.tensor(0., requires_grad = True)
 
         for (mem, time, (expire_span, attn, ff)) in zip(mems_layers, times_layers, self.layers):
@@ -164,7 +167,6 @@ class ExpireSpanTransformerXL(nn.Module):
             new_elapsed_times = map(lambda t: safe_cat((safe_add(t, n), new_times), dim = 0), times_layers)
             new_elapsed_times = map(lambda t: t[-self.max_mem_len:], new_elapsed_times)
 
-            mems = list(new_memories)
-            elapsed_times = list(new_elapsed_times)
+            memory = Memory(list(new_memories), list(new_elapsed_times))
 
-        return logits, mems, elapsed_times, aux_loss
+        return logits, memory, aux_loss
