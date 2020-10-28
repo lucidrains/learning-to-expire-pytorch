@@ -18,6 +18,24 @@ def safe_cat(tensors, dim = -1):
         return tensors[0]
     return torch.cat(tensors, dim = dim)
 
+def safe_add(tensor, n):
+    if tensor is None:
+        return None
+    return tensor + n
+
+# expire span logic
+
+class ExpireSpan(nn.Module):
+    def __init__(self, dim, max_mem_len, ramp_length):
+        super().__init__()
+        self.max_mem_len = max_mem_len
+        self.ramp_length = ramp_length
+        self.to_expiration = nn.Linear(dim, 1)
+
+    def forward(self, x):
+        expirations = self.to_expiration(x).squeeze(-1).sigmoid() * self.max_mem_len
+        return expirations
+
 # classes
 
 class PreNorm(nn.Module):
@@ -43,16 +61,17 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class CausalAttention(nn.Module):
-    def __init__(self, dim, heads = 8):
+    def __init__(self, dim, expire_span, heads = 8):
         super().__init__()
         self.heads = heads
         self.scale = (dim // heads) ** -0.5
+        self.expire_span = expire_span
 
         self.to_q = nn.Linear(dim, dim, bias = False)
         self.to_kv = nn.Linear(dim, dim * 2, bias = False)
         self.to_out = nn.Linear(dim, dim)
 
-    def forward(self, x, mem = None):
+    def forward(self, x, mem = None, time = None):
         n, h, scale, device = x.shape[1], self.heads, self.scale, x.device
 
         q = self.to_q(x)
@@ -72,9 +91,18 @@ class CausalAttention(nn.Module):
 
         attn = dots.softmax(dim = -1)
 
+        exps = None
+        if exists(mem):
+            exps = self.expire_span(mem)
+            exps = rearrange(exps, 'b j -> b () () j')
+            t = rearrange(time, 'j -> () j')
+            r = F.pad(exps - t, (0, n), value = 1.)
+            m = r.clamp(min = 0., max = 1.)
+            attn  = attn * m
+
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
+        return self.to_out(out), exps
 
 class ExpireSpanTransformerXL(nn.Module):
     def __init__(
@@ -84,36 +112,61 @@ class ExpireSpanTransformerXL(nn.Module):
         dim,
         depth,
         seq_len,
-        num_memory_blocks,
-        heads = 8):
+        heads = 8,
+        num_memory_blocks = 10,
+        expire_loss_coef = 1e-6,
+        ramp_length = 128):
         super().__init__()
         self.token_emb = nn.Embedding(num_tokens, dim)
 
         self.depth = depth
+        self.seq_len = seq_len
         self.max_mem_len = num_memory_blocks * seq_len
+
+        self.expire_span = ExpireSpan(dim, self.max_mem_len, ramp_length)
+        self.expire_loss_coef = expire_loss_coef
 
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                PreNorm(dim, CausalAttention(dim, heads = heads)),
+                PreNorm(dim, CausalAttention(dim, self.expire_span, heads = heads)),
                 PreNorm(dim, FeedForward(dim)),
             ]))
 
         self.to_logits = nn.Linear(dim, num_tokens)
 
-    def forward(self, x, mems = None):
+    def forward(self, x, mems = None, elapsed_times = None):
+        n, device = x.shape[1], x.device
         x = self.token_emb(x)
 
+
         hidden_states = []
-        mems = default(mems, (None,) * self.depth)
-        for (mem, (attn, ff)) in zip(mems, self.layers):
+        mems_layers = default(mems, (None,) * self.depth)
+        times_layers = default(elapsed_times, (None,) * self.depth)
+        aux_loss = torch.tensor(0., requires_grad = True)
+
+        for (mem, time, (attn, ff)) in zip(mems_layers, times_layers, self.layers):
             hidden_states.append(x)
 
-            x = attn(x, mem = mem) + x
+            attn_out, exps = attn(x, mem = mem, time = time)
+
+            x = x + attn_out
             x = ff(x) + x
+
+            if exists(exps):
+                aux_loss = aux_loss + (exps / self.seq_len).sum() * self.expire_loss_coef
 
         logits = self.to_logits(x)
 
-        new_memories = map(lambda t: safe_cat(t, dim = 1), list(zip(mems, hidden_states)))
-        new_memories = map(lambda t: t[:, -self.max_mem_len:].detach(), new_memories)
-        return logits, list(new_memories)
+        if self.seq_len == n:
+            new_memories = map(lambda t: safe_cat(t, dim = 1), list(zip(mems_layers, hidden_states)))
+            new_memories = map(lambda t: t[:, -self.max_mem_len:].detach(), new_memories)
+
+            new_times = torch.arange(n - 1, -1, -1, device = device)
+            new_elapsed_times = map(lambda t: safe_cat((safe_add(t, n), new_times), dim = 0), times_layers)
+            new_elapsed_times = map(lambda t: t[-self.max_mem_len:], new_elapsed_times)
+
+            mems = list(new_memories)
+            elapsed_times = list(new_elapsed_times)
+
+        return logits, mems, elapsed_times, aux_loss
