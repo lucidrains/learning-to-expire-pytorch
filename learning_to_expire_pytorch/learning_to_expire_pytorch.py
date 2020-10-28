@@ -23,7 +23,7 @@ def safe_cat(tensors, dim = -1):
     return torch.cat(tensors, dim = dim)
 
 def safe_add(tensor, n):
-    if tensor is None:
+    if not exists(tensor):
         return None
     return tensor + n
 
@@ -35,14 +35,14 @@ class ExpireSpan(nn.Module):
         self.max_mem_len = max_mem_len
         self.ramp_length = ramp_length
         self.to_expiration = nn.Linear(dim, 1)
+        nn.init.constant_(self.to_expiration.bias.data, val = -self.max_mem_len)
 
     def forward(self, mem, time, seq_len):
         exps = self.to_expiration(mem).squeeze(-1).sigmoid() * self.max_mem_len
         exps = rearrange(exps, 'b j -> b () () j')
         t = rearrange(time, 'j -> () j')
         r = F.pad(exps - t, (0, seq_len), value = 1.)
-        R = (r / self.ramp_length) + 1
-        mask = R.clamp(min = 0., max = 1.)
+        mask = torch.clamp((r / self.ramp_length) + 1, min = 0., max = 1.)
         return exps, mask
 
 # classes
