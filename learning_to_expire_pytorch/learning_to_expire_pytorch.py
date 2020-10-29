@@ -27,6 +27,28 @@ def safe_add(tensor, n):
         return None
     return tensor + n
 
+# positional embedding
+
+def rel_shift(t):
+    b, h, i, j, device, dtype = *t.shape, t.device, t.dtype
+    zero_pad = torch.zeros((b, h, i, 1), device = device, dtype = dtype)
+    concatted = torch.cat([zero_pad, t], dim = -1)
+    shifted = concatted.view(b, h, j + 1, i)[:, :, 1:]
+    return shifted.view_as(t)
+
+class SinusoidalEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        inv_freq = 1. / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+    def forward(self, x):
+        n, device = x.shape[1], x.device
+        t = torch.arange(n - 1, -1, -1, device = device).type_as(self.inv_freq)
+        sinusoid_inp = einsum('i , j -> i j', t, self.inv_freq)
+        emb = torch.cat((sinusoid_inp.sin(), sinusoid_inp.cos()), dim = -1)
+        return emb[:, :]
+
 # expire span logic
 
 class ExpireSpan(nn.Module):
@@ -72,14 +94,16 @@ class FeedForward(nn.Module):
 class CausalAttention(nn.Module):
     def __init__(self, dim, heads = 8):
         super().__init__()
+        dim_head = dim // heads
         self.heads = heads
-        self.scale = (dim // heads) ** -0.5
+        self.scale = dim_head ** -0.5
 
-        self.to_q = nn.Linear(dim, dim, bias = False)
-        self.to_kv = nn.Linear(dim, dim * 2, bias = False)
+        self.to_pos = nn.Linear(dim, dim_head)
+        self.to_q = nn.Linear(dim, dim)
+        self.to_kv = nn.Linear(dim, dim * 2)
         self.to_out = nn.Linear(dim, dim)
 
-    def forward(self, x, mem = None, expire_mask = None):
+    def forward(self, x, pos_emb, mem = None, expire_mask = None):
         n, h, scale, device = x.shape[1], self.heads, self.scale, x.device
 
         q = self.to_q(x)
@@ -92,11 +116,20 @@ class CausalAttention(nn.Module):
 
         dots = einsum('b h i d, b h j d -> b h i j', q, k) * scale
 
+        # calculate relative positional contribution
+        pos = self.to_pos(pos_emb)
+        pos_dots = einsum('b h i d, j d -> b h i j', q, pos) * scale
+        pos_dots = rel_shift(pos_dots)
+        pos_dots = F.pad(pos_dots, (mem_len, 0), value = 0)
+        dots += pos_dots
+
+        # causal mask
         mask = torch.ones(dots.shape[-2:], device = device).triu_(mem_len + 1).bool()
         mask = rearrange(mask, 'i j -> () () i j')
         dots.masked_fill_(mask, float('-inf'))
         del mask
 
+        # attention
         attn = dots.softmax(dim = -1)
 
         if exists(expire_mask):
@@ -120,6 +153,7 @@ class ExpireSpanTransformerXL(nn.Module):
         ramp_length = 128):
         super().__init__()
         self.token_emb = nn.Embedding(num_tokens, dim)
+        self.sinusoidal_emb = SinusoidalEmbedding(dim)
 
         self.depth = depth
         self.seq_len = seq_len
@@ -140,6 +174,7 @@ class ExpireSpanTransformerXL(nn.Module):
     def forward(self, x, memory = None):
         n, device = x.shape[1], x.device
         x = self.token_emb(x)
+        pos_emb = self.sinusoidal_emb(x)
 
         hidden_states = []
         mems_layers = memory.mems if exists(memory) else ((None,) * self.depth)
@@ -151,7 +186,7 @@ class ExpireSpanTransformerXL(nn.Module):
 
             exps, expire_mask = expire_span(mem, time, seq_len = n) if exists(mem) else (None, None)
 
-            x = attn(x, mem = mem, expire_mask = expire_mask) + x
+            x = attn(x, pos_emb = pos_emb, mem = mem, expire_mask = expire_mask) + x
             x = ff(x) + x
 
             if exists(exps):
