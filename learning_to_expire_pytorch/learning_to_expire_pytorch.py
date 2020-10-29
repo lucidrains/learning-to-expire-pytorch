@@ -47,7 +47,7 @@ class SinusoidalEmbedding(nn.Module):
         t = torch.arange(n - 1, -1, -1, device = device).type_as(self.inv_freq)
         sinusoid_inp = einsum('i , j -> i j', t, self.inv_freq)
         emb = torch.cat((sinusoid_inp.sin(), sinusoid_inp.cos()), dim = -1)
-        return emb[:, :]
+        return emb
 
 # expire span logic
 
