@@ -172,7 +172,7 @@ class ExpireSpanTransformerXL(nn.Module):
         self.to_logits = nn.Linear(dim, num_tokens)
 
     def forward(self, x, memory = None):
-        n, device = x.shape[1], x.device
+        b, n, device = *x.shape, x.device
         x = self.token_emb(x)
         pos_emb = self.sinusoidal_emb(x)
 
@@ -185,6 +185,13 @@ class ExpireSpanTransformerXL(nn.Module):
             hidden_states.append(x)
 
             exps, expire_mask = expire_span(mem, time, seq_len = n) if exists(mem) else (None, None)
+
+            if self.training and exists(time):
+                forget_time_thres = torch.randint(0, self.max_mem_len, (b, 1), device = device)
+                forget_dropout_mask = (time < forget_time_thres).float()
+                forget_dropout_mask = rearrange(forget_dropout_mask, 'b n -> b () () n')
+                forget_dropout_mask = F.pad(forget_dropout_mask, (0, n), value = 1.)
+                expire_mask *= forget_dropout_mask
 
             x = attn(x, pos_emb = pos_emb, mem = mem, expire_mask = expire_mask) + x
             x = ff(x) + x
