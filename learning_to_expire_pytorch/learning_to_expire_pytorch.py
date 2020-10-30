@@ -1,7 +1,7 @@
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 from collections import namedtuple
 
 # constants
@@ -62,7 +62,7 @@ class ExpireSpan(nn.Module):
     def forward(self, mem, time, seq_len):
         exps = self.to_expiration(mem).squeeze(-1).sigmoid() * self.max_mem_len
         exps = rearrange(exps, 'b j -> b () () j')
-        t = rearrange(time, 'j -> () j')
+        t = rearrange(time, 'b j -> b () () j')
         r = F.pad(exps - t, (0, seq_len), value = 1.)
         mask = torch.clamp((r / self.ramp_length) + 1, min = 0., max = 1.)
         return exps, mask
@@ -155,6 +155,7 @@ class ExpireSpanTransformerXL(nn.Module):
         self.token_emb = nn.Embedding(num_tokens, dim)
         self.sinusoidal_emb = SinusoidalEmbedding(dim)
 
+        self.dim = dim
         self.depth = depth
         self.seq_len = seq_len
         self.max_mem_len = num_memory_blocks * seq_len
@@ -172,11 +173,12 @@ class ExpireSpanTransformerXL(nn.Module):
         self.to_logits = nn.Linear(dim, num_tokens)
 
     def forward(self, x, memory = None):
-        b, n, device = *x.shape, x.device
+        b, n, d, device = *x.shape, self.dim, x.device
         x = self.token_emb(x)
         pos_emb = self.sinusoidal_emb(x)
 
         hidden_states = []
+        expire_masks_layers = []
         mems_layers = memory.mems if exists(memory) else ((None,) * self.depth)
         times_layers = memory.elapsed_times if exists(memory) else ((None,) * self.depth)
         aux_loss = torch.tensor(0., requires_grad = True)
@@ -185,6 +187,7 @@ class ExpireSpanTransformerXL(nn.Module):
             hidden_states.append(x)
 
             exps, expire_mask = expire_span(mem, time, seq_len = n) if exists(mem) else (None, None)
+            expire_masks_layers.append(expire_mask)
 
             if self.training and exists(time):
                 forget_time_thres = torch.randint(0, self.max_mem_len, (b, 1), device = device)
@@ -197,16 +200,46 @@ class ExpireSpanTransformerXL(nn.Module):
             x = ff(x) + x
 
             if exists(exps):
-                aux_loss = aux_loss + (exps / self.seq_len).sum() * self.expire_loss_coef
+                # unsure if this is implemented correctly
+                # paper seems to suggest only adding l1 auxiliary loss for expirations that yield a soft masking value on the ramp (between 0 or 1)
+                expiring_exps_mask = (expire_mask > 0) & (expire_mask < 1.)
+                expiring_exps = exps.masked_select(expiring_exps_mask[..., :-n])
+                aux_loss = aux_loss + (expiring_exps / self.seq_len).sum() * self.expire_loss_coef
 
         logits = self.to_logits(x)
 
         if self.seq_len == n:
+            if exists(expire_mask):
+                mems_layers_new = []
+                times_layers_new = []
+
+                for mems, times, expire_mask in zip(mems_layers, times_layers, expire_masks_layers):
+                    expire_mask = rearrange(expire_mask, 'b () () i -> b i')
+                    # discard expired memories
+                    expired_exps_mask = (expire_mask <= 0)[..., :-n]
+                    # it is not possible to expire different amounts of memories across batches
+                    # for now, will just expire the minimum of the expired memories across batches
+                    num_to_expire = min(expired_exps_mask.sum(dim = -1))
+                    _, indices = expired_exps_mask.float().topk(k = num_to_expire, dim = -1)
+                    even_expired_exps_mask = torch.zeros_like(expired_exps_mask, device = device).scatter(-1, indices, 1.).bool()
+
+                    mems = mems.masked_select(~even_expired_exps_mask.unsqueeze(-1))
+                    mems = mems.reshape(b, -1, d)
+                    mems_layers_new.append(mems)
+
+                    times = times.masked_select(~even_expired_exps_mask)
+                    times = times.reshape(b, -1)
+                    times_layers_new.append(times)
+
+                mems_layers = mems_layers_new
+                times_layers = times_layers_new
+
             new_memories = map(lambda t: safe_cat(t, dim = 1), list(zip(mems_layers, hidden_states)))
             new_memories = map(lambda t: t[:, -self.max_mem_len:].detach(), new_memories)
 
             new_times = torch.arange(n - 1, -1, -1, device = device)
-            new_elapsed_times = map(lambda t: safe_cat((safe_add(t, n), new_times), dim = 0), times_layers)
+            new_times = repeat(new_times, 'n -> b n', b = b)
+            new_elapsed_times = map(lambda t: safe_cat((safe_add(t, n), new_times), dim = 1), times_layers)
             new_elapsed_times = map(lambda t: t[-self.max_mem_len:], new_elapsed_times)
 
             memory = Memory(list(new_memories), list(new_elapsed_times))
